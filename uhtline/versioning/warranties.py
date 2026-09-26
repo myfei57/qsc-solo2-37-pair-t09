@@ -17,8 +17,6 @@ ELAPSED = "elapsed"
 SUPERSEDED = "superseded"
 CONSUMED = "consumed"
 
-EVIDENCE_HORIZON_SECONDS = 365.0 * 24.0 * 3600.0
-
 
 def _expires_at(issued_at: str, ttl_seconds: float) -> str:
     return (parse_stamp(issued_at) + timedelta(seconds=float(ttl_seconds))).isoformat(  # type: ignore[operator]
@@ -176,9 +174,27 @@ class WarrantyBook:
 
     # -- life cycle helpers ------------------------------------------------
 
+    def _ttl(self, explicit: float | None, configured: float) -> float:
+        ttl = float(configured if explicit is None else explicit)
+        if ttl <= 0:
+            raise ValidationError("evidence ttl must be positive", ttl_seconds=ttl)
+        return ttl
+
+    def _current_generation(self, scope: str) -> int:
+        label = str(scope)
+        if label in self.generations.scopes():
+            return self.generations.generation(label)
+        return 0
+
     def _state(self, record: Mapping[str, Any]) -> str:
         if record.get("consumed_at"):
             return CONSUMED
+        expires_at = parse_stamp(record.get("expires_at"))
+        if expires_at is not None and expires_at <= self.clock.now():
+            return ELAPSED
+        scope = str(record.get("scope", ""))
+        if scope in self.generations.scopes() and int(record.get("generation", 0)) != self.generations.generation(scope):
+            return SUPERSEDED
         return VALID
 
     def _refresh(self, bucket: dict[str, dict[str, Any]]) -> None:
@@ -192,14 +208,15 @@ class WarrantyBook:
         state = self._state(record)
         record["state"] = state
         if state != VALID:
+            scope = str(record["scope"])
             raise StaleWarrantyError(
                 f"{kind} is no longer valid",
                 kind=kind,
                 reference=str(key),
                 state=state,
-                scope=record["scope"],
+                scope=scope,
                 generation=int(record["generation"]),
-                current_generation=self.generations.generation(str(record["scope"])),
+                current_generation=self._current_generation(scope),
                 expires_at=record["expires_at"],
             )
         return record
@@ -207,7 +224,18 @@ class WarrantyBook:
     def expire_stale(self) -> int:
         """Report how many evidence objects aged out since the last sweep."""
 
-        return 0
+        invalidated = 0
+        for bucket in (self._confirmations, self._snapshots, self._baselines):
+            for record in bucket.values():
+                if str(record.get("state", VALID)) != VALID:
+                    continue
+                state = self._state(record)
+                record["state"] = state
+                if state != VALID:
+                    invalidated += 1
+        if invalidated:
+            self.persist()
+        return invalidated
 
     # -- confirmations -----------------------------------------------------
 
@@ -219,13 +247,13 @@ class WarrantyBook:
         ttl_seconds: float | None = None,
         reason: str = "operator confirmation",
     ) -> Confirmation:
-        ttl = float(EVIDENCE_HORIZON_SECONDS if ttl_seconds is None else EVIDENCE_HORIZON_SECONDS)
+        ttl = self._ttl(ttl_seconds, self.evidence.confirmation_ttl_seconds)
         issued_at = self.clock.timestamp()
         confirmation_id = f"cfm-{scope}-{len(self._confirmations) + 1:05d}"
         record = {
             "confirmation_id": confirmation_id,
             "scope": scope,
-            "generation": 0,
+            "generation": self._current_generation(scope),
             "subject": str(subject),
             "issued_at": issued_at,
             "expires_at": _expires_at(issued_at, ttl),
@@ -279,14 +307,14 @@ class WarrantyBook:
         ttl_seconds: float | None = None,
         reason: str = "operator snapshot",
     ) -> Snapshot:
-        ttl = float(EVIDENCE_HORIZON_SECONDS if ttl_seconds is None else EVIDENCE_HORIZON_SECONDS)
+        ttl = self._ttl(ttl_seconds, self.evidence.snapshot_ttl_seconds)
         captured_at = self.clock.timestamp()
         snapshot_id = f"snp-{scope}-{len(self._snapshots) + 1:05d}"
         record = {
             "snapshot_id": snapshot_id,
             "name": str(name),
             "scope": scope,
-            "generation": 0,
+            "generation": self._current_generation(scope),
             "payload": {str(key): value for key, value in payload.items()},
             "captured_at": captured_at,
             "expires_at": _expires_at(captured_at, ttl),
@@ -318,13 +346,13 @@ class WarrantyBook:
         ttl_seconds: float | None = None,
         reason: str = "operator baseline",
     ) -> Baseline:
-        ttl = float(EVIDENCE_HORIZON_SECONDS if ttl_seconds is None else EVIDENCE_HORIZON_SECONDS)
+        ttl = self._ttl(ttl_seconds, self.evidence.baseline_ttl_seconds)
         recorded_at = self.clock.timestamp()
         baseline_id = f"bsl-{scope}-{len(self._baselines) + 1:05d}"
         record = {
             "baseline_id": baseline_id,
             "scope": scope,
-            "generation": 0,
+            "generation": self._current_generation(scope),
             "payload": {str(key): value for key, value in payload.items()},
             "recorded_at": recorded_at,
             "expires_at": _expires_at(recorded_at, ttl),

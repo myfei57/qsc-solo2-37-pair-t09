@@ -100,18 +100,30 @@ class GenerationRegistry:
         return self.current(scope).generation
 
     def is_current(self, scope: str, generation: int) -> bool:
-        return self.revision(scope, generation) is not None
+        revisions = self._history.get(str(scope))
+        if not revisions:
+            return False
+        return revisions[-1].generation == int(generation)
 
     def require_current(self, scope: str, generation: int) -> ParameterRevision:
         """Reject a caller that still holds a superseded generation."""
 
+        revisions = self._history.get(str(scope))
+        head = revisions[-1] if revisions else None
         revision = self.revision(scope, generation)
         if revision is None:
             raise StaleGenerationError(
                 "generation was never published for this scope",
                 scope=scope,
                 generation=int(generation),
-                current=self.generation(scope) if self._history.get(scope) else None,
+                current=None if head is None else head.generation,
+            )
+        if head is None or revision.generation != head.generation:
+            raise StaleGenerationError(
+                "generation was superseded by a newer publication",
+                scope=scope,
+                generation=int(generation),
+                current=None if head is None else head.generation,
             )
         return revision
 
